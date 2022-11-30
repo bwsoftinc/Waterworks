@@ -1,0 +1,376 @@
+substitutions:
+  pump_pin: "GPIO16"
+  moisture_pin: "GPIO36"
+  transistor_pin: "GPIO26"
+  
+  sensor_samples: "5"
+  sleep_time: "1h"
+  threshold_low: "20"
+  threshold_high: "90"
+  water_minutes: "3"
+
+globals:
+  - id: wake_reason
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: water_loop
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: water_minutes
+    type: int
+    restore_value: no
+    initial_value: $water_minutes
+  - id: threshold_high
+    type: int
+    restore_value: no
+    initial_value: $threshold_high
+  - id: threshold_low
+    type: int
+    restore_value: no
+    initial_value: $threshold_low
+
+################################################################################
+#PLATFORM
+esphome:
+  name: waterworks
+  platform: esp32
+  board: firebeetle32
+  platformio_options:
+    board_build.f_cpu: 80000000L
+  on_boot:
+    - priority: 900
+      then:
+      - lambda: id(wake_reason) = esp_sleep_get_wakeup_cause();
+    - priority: 200
+      then:
+      - script.execute: main_routine
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: on
+  manual_ip:
+     static_ip: !secret ip_148
+     gateway: !secret gateway
+     subnet: !secret subnet
+
+ota:
+  password: !secret ota_password
+
+mqtt:
+  broker: !secret mqtt_addr
+  will_message:
+    topic: waterworks/binary_sensor/device_awake/state
+    retain: true
+    payload: "OFF"
+  on_message:
+    - topic: waterworks/switch/stay_awake/persisted
+      payload: "ON"
+      then:
+       if:
+        condition:
+          - switch.is_off: prevent_sleep
+        then:
+          - switch.turn_on: prevent_sleep
+
+time:
+  - platform: sntp
+    timezone: America/Los_Angeles
+    servers: !secret ntp_addr
+    id: ntp_time
+    
+logger:
+  #level: DEBUG
+  level: VERBOSE
+  #level: NONE
+
+################################################################################
+#ROUTINES
+script:
+  - id: main_routine
+    then: 
+    - binary_sensor.template.publish:
+        id: awake_status
+        state: true
+    - mqtt.publish:
+          topic: waterworks/wakeup
+          payload: !lambda char s[3];sprintf(s, "%d", id(wake_reason));return s;
+    - script.execute: sample_sensors
+    - script.wait: sample_sensors
+    - if:
+        condition: 
+          lambda: return id(moisture_sensor).state < id(threshold_low);
+        then: 
+          - script.execute: water_sense
+          - script.wait: water_sense
+    - script.execute: consider_sleep
+
+
+  - id: sample_sensors
+    then:
+    - script.execute: sample_soil
+    - script.wait: sample_soil
+    - script.execute: sample_batt
+    - script.wait: sample_batt
+    - component.update: timestamp
+    
+    
+  - id: sample_batt
+    then:
+    - repeat: 
+        count: $sensor_samples
+        then: 
+          - delay: 0.05s
+          - component.update: esp_vbatt
+    
+    
+  - id: sample_soil
+    then:
+    - output.turn_on: moisture_power
+    - delay: 0.1s
+    - repeat: 
+        count: $sensor_samples
+        then: 
+          - delay: 0.05s
+          - component.update: moisture_sensor
+    - output.turn_off: moisture_power
+  
+  
+  - id: consider_sleep
+    mode: queued
+    then:
+      - if:
+          condition:
+            or:
+              - switch.is_on: prevent_sleep
+              - switch.is_on: water_plants
+          then:
+           - delay: 15s
+           - script.execute: consider_sleep
+          else:
+           - script.execute: sleep_now
+
+
+  - id: sleep_now
+    then:
+    - logger.log: "Going to sleep"
+    - mqtt.publish:
+          topic: waterworks/binary_sensor/device_awake/state
+          retain: true
+          payload: "OFF"
+    - deep_sleep.enter:
+        id: power_nap
+        sleep_duration: $sleep_time 
+  
+  
+  - id: water_sense
+    then:
+      - if:
+          condition:
+            switch.is_on: water_plants
+          then:
+            - script.wait: water_cycle
+          else:
+            - switch.turn_on: water_plants
+
+  - id: water_cycle
+    then:
+      - globals.set: 
+          id: water_loop
+          value: !lambda return 60 * id(water_minutes);
+      - while:
+          condition:
+            lambda: return id(water_loop) > 0 && id(moisture_sensor).state < id(threshold_high);
+          then:
+            - globals.set:
+                id: water_loop
+                value: !lambda return id(water_loop) - 1;
+            - delay: 1s
+            - if:
+                condition:
+                  lambda: return id(water_loop) % 20 == 0;
+                then: 
+                  - script.execute: sample_soil
+                  - script.wait: sample_soil
+
+################################################################################
+#SWITCHES
+deep_sleep:
+  id: power_nap
+  wakeup_pin: 
+    number: GPIO27
+    inverted: true
+
+
+binary_sensor:
+  - platform: gpio
+    id: sleep_toggle
+    pin: 
+      number: GPIO27
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_release:
+     if:
+       condition: 
+         - switch.is_on: prevent_sleep
+       then: 
+         - switch.turn_off: prevent_sleep
+       else:
+         - switch.turn_on: prevent_sleep
+       
+       
+  - platform: template
+    id: awake_status
+    device_class: running
+    name: "Device Awake"
+
+
+switch:
+  - platform: template
+    id: prevent_sleep
+    name: "Stay Awake"
+    icon: mdi:sleep-off
+    entity_category: config
+    assumed_state: true
+    command_retain: true
+    optimistic: true
+    on_turn_on:
+      - output.turn_on: status_light
+    on_turn_off:
+      - output.turn_off: status_light
+      
+    
+  - platform: gpio
+    id: water_plants
+    restore_mode: ALWAYS_OFF
+    pin: 
+      number: $pump_pin
+      mode: OUTPUT
+    name: "Water Plants"
+    icon: mdi:watering-can
+    on_turn_on:
+      - globals.set:
+          id: water_loop
+          value: !lambda return 0;
+      - script.wait: water_cycle
+      - script.execute: water_cycle
+      - script.wait: water_cycle
+      - switch.turn_off: water_plants
+    on_turn_off:
+      - globals.set:
+          id: water_loop
+          value: !lambda return 0;
+      - script.wait: water_cycle
+  
+button:
+  - platform: template
+    name: "Refresh Sensors"
+    on_press:
+      - script.execute: sample_sensors
+
+
+output:
+  - platform: gpio
+    id: status_light
+    pin: GPIO2
+  - platform: gpio
+    id: moisture_power
+    pin: $transistor_pin
+    
+################################################################################
+#SENSORS
+sensor:
+  - platform: adc
+    pin: $moisture_pin
+    id: moisture_sensor
+    attenuation: 11db
+    name: "Pepper Soil Moisture"
+    icon: mdi:chili-alert
+    unit_of_measurement: "%"
+    device_class: humidity
+    update_interval: never
+    accuracy_decimals: 2
+    filters:
+      - sliding_window_moving_average:
+          window_size: $sensor_samples
+          send_every: $sensor_samples
+          send_first_at: $sensor_samples
+      - calibrate_linear:
+          - 2.9 -> 0.0
+          - 1.5 -> 100.0
+      - lambda: if(x < 0.0) return 0.0; if(x > 100.0) return 100.0; return x;
+      
+      
+  - platform: adc
+    pin: GPIO34
+    id: esp_vbatt
+    attenuation: 11db
+    update_interval: never
+    filters:
+      - sliding_window_moving_average:
+          window_size: $sensor_samples
+          send_every: $sensor_samples
+          send_first_at: $sensor_samples
+      - calibrate_linear:
+          - 2.155 -> 4.277
+          - 2.046 -> 4.11
+          - 1.823 -> 3.612
+          - 1.759 -> 3.511
+          - 1.729 -> 3.433
+          - 1.598 -> 3.186
+    on_value:
+      then:
+        - sensor.template.publish:
+            id: vbat_voltage
+            state: !lambda return x;
+        - sensor.template.publish:
+            id: vbat_level
+            state: !lambda return x;
+
+
+  - platform: template
+    id: vbat_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: 'V'
+    icon: mdi:battery-charging-outline
+    device_class: voltage
+    update_interval: never
+    accuracy_decimals: 2
+    retain: true
+    filters:
+      - lambda: if(x > 4.2) return 4.2; return x;
+      
+      
+  - platform: template
+    id: vbat_level
+    name: "Battery Level"
+    unit_of_measurement: '%'
+    device_class: battery
+    update_interval: never
+    accuracy_decimals: 0
+    retain: true
+    filters:
+      - calibrate_linear:
+          - 4.2 -> 100.0
+          - 3.4 -> 0.0
+      - lambda: if(x < 0.0) return 0.0; if(x > 100.0) return 100.0; return x;
+
+
+text_sensor:
+  - platform: template
+    id: timestamp
+    icon: mdi:update
+    name: "Last Updated"
+    update_interval: never
+    retain: true
+    lambda: |- 
+      char s[20]; time_t t = id(ntp_time).utcnow().timestamp;
+      strftime(s, sizeof(s), "%Y-%m-%d %H:%M:%S", localtime(&t)); return { s };
+      
